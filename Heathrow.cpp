@@ -22,7 +22,7 @@
 /*
  * Copyright (c) 1999 Apple Computer, Inc.  All rights reserved.
  *
- *  DRI: Josh de Cesare
+ *  DRI: Robert Zhang 
  *
  */
 
@@ -38,7 +38,6 @@
 #include <IOKit/platform/AppleNMI.h>
 
 #include "Heathrow.h"
-
 #include <IOKit/ppc/IODBDMA.h>
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
@@ -50,18 +49,29 @@ OSDefineMetaClassAndStructors(Heathrow, AppleMacIO);
 bool Heathrow::start(IOService *provider)
 {
   bool		     ret;
-  
   // Call MacIO's start.
   if (!super::start(provider))
     return false;
 
   // callPlatformFunction symbols
+  heathrow_enableSCC = OSSymbol::withCString("EnableSCC");
+  heathrow_powerModem = OSSymbol::withCString("PowerModem");
+  heathrow_modemResetLow = OSSymbol::withCString("ModemResetLow");
+  heathrow_modemResetHigh = OSSymbol::withCString("ModemResetHigh");
   heathrow_sleepState = OSSymbol::withCString("heathrow_sleepState");
   heathrow_powerMediaBay = OSSymbol::withCString("powerMediaBay");
   heathrow_set_light = OSSymbol::withCString("heathrow_set_light");
+  heathrow_writeRegUInt8 = OSSymbol::withCString("heathrow_writeRegUInt8");
+  heathrow_safeWriteRegUInt8 = OSSymbol::withCString("heathrow_safeWriteRegUInt8");
+  heathrow_safeReadRegUInt8 = OSSymbol::withCString("heathrow_safeReadRegUInt8");
+  heathrow_safeWriteRegUInt32 = OSSymbol::withCString("heathrow_safeWriteRegUInt32");
+  heathrow_safeReadRegUInt32 = OSSymbol::withCString("heathrow_safeReadRegUInt32");
 
   // just initializes this:
   mediaIsOn = true;
+
+  // sets up the mutex lock:
+  mutex = IOSimpleLockAlloc();
       
   // Figure out which heathrow this is.
   if (IODTMatchNubWithKeys(provider, "heathrow"))
@@ -114,22 +124,65 @@ IOReturn Heathrow::callPlatformFunction(const OSSymbol *functionName,
         return kIOReturnSuccess;
     }
 
-    if (functionName->isEqualTo("EnableSCC"))
+    if (functionName == heathrow_enableSCC)
     {
         EnableSCC((bool)param1);
         return kIOReturnSuccess;
     }
 
-    if (functionName->isEqualTo("PowerModem"))
+    if (functionName == heathrow_powerModem)
     {
         PowerModem((bool)param1);
         return kIOReturnSuccess;
     }
 
+    if (functionName ==  heathrow_modemResetLow)
+    {
+        ModemResetLow();
+        return kIOReturnSuccess;
+    }
+
+    if (functionName == heathrow_modemResetHigh)
+    {
+        ModemResetHigh();
+        return kIOReturnSuccess;
+    }
 
     if (functionName == heathrow_set_light)
     {
         setChassisLightFullpower((bool)param1);
+        return kIOReturnSuccess;
+    }
+
+    if (functionName == heathrow_writeRegUInt8)
+    {
+        writeRegUInt8(*(unsigned long *)param1, (UInt8)param2);
+        return kIOReturnSuccess;
+    }
+
+    if (functionName == heathrow_safeWriteRegUInt8)
+    {
+        safeWriteRegUInt8((unsigned long)param1, (UInt8)param2, (UInt8)param3);
+        return kIOReturnSuccess;
+    }
+
+    if (functionName == heathrow_safeReadRegUInt8)
+    {
+        UInt8 *returnval = (UInt8 *)param2;
+        *returnval = safeReadRegUInt8((unsigned long)param1);
+        return kIOReturnSuccess;
+    }
+
+    if (functionName == heathrow_safeWriteRegUInt32)
+    {
+        safeWriteRegUInt32((unsigned long)param1, (UInt32)param2, (UInt32)param3);
+        return kIOReturnSuccess;
+    }
+
+    if (functionName == heathrow_safeReadRegUInt32)
+    {
+        UInt32 *returnval = param2;
+        *returnval = safeReadRegUInt32((unsigned long)param1);
         return kIOReturnSuccess;
     }
 
@@ -138,25 +191,35 @@ IOReturn Heathrow::callPlatformFunction(const OSSymbol *functionName,
 
 void Heathrow::EnableSCC(bool state)
 {
+	IOInterruptState intState;
+    
+    if ( mutex  != NULL )
+    	intState = IOSimpleLockLockDisableInterrupt(mutex);
+	
     if (state)
     {
-        // Enables the SCC cell:
-        *(UInt32*)(heathrowBaseAddress + 0x38) |= 0x00420000;
+
+        // Enables the SCC cell: 0x00420000 (this starts scc clock and enables scca)
+        *(UInt32*)(heathrowBaseAddress + heathrowFCROffset) |= ( heathrowFCSCCCEn | heathrowFCSCCAEn );	    
         eieio();
 
-        // Resets the SCC:
-        *(UInt32*)(heathrowBaseAddress + 0x38) |= 0x00000002;
+       /* // Resets the SCC:
+        *(UInt32*)(heathrowBaseAddress + heathrowFCROffset) |= heathrowFCResetSCC;
         eieio();
 
         IOSleep(15);
-        *(UInt32*)(heathrowBaseAddress + 0x38) &= ~0x00000002;
-        eieio();
+        *(UInt32*)(heathrowBaseAddress + heathrowFCROffset) &= ~heathrowFCResetSCC;
+        eieio(); */
     }
     else
     {
         // disable
     }
     
+    if ( mutex  != NULL )
+		IOSimpleLockUnlockEnableInterrupt(mutex, intState);
+    
+
     return;
 }
 
@@ -166,22 +229,139 @@ void Heathrow::PowerModem(bool state)
     // disables the nvram. So on Yikes we exit without doing
     // anything. Also setting this bit has as bas nvram side
     // effects.
-    if (IODTMatchNubWithKeys(getPlatform()->getProvider(), "'PowerMac1,1'") ||
+  
+  IOInterruptState intState;
+  
+  if (IODTMatchNubWithKeys(getPlatform()->getProvider(), "'PowerMac1,1'") ||
         IODTMatchNubWithKeys(getPlatform()->getProvider(), "'PowerMac1,2'"))
         return;
+
+  if ( mutex  != NULL )
+     intState = IOSimpleLockLockDisableInterrupt(mutex);
         
     if (state)
     {
-        *(UInt32*)(heathrowBaseAddress + 0x38) &= ~0x01000000;
+        *(UInt32*)(heathrowBaseAddress + heathrowFCROffset) &= ~heathrowFCTrans;
         eieio();
     }
     else
     {
-        *(UInt32*)(heathrowBaseAddress + 0x38) |= 0x01000000;
+        *(UInt32*)(heathrowBaseAddress + heathrowFCROffset) |= heathrowFCTrans;
         eieio();
     }
+  if ( mutex  != NULL )
+     IOSimpleLockUnlockEnableInterrupt(mutex, intState);
 
     return;
+}
+
+void Heathrow::ModemResetLow()
+{
+		IOInterruptState intState;
+  		if ( mutex  != NULL )
+        	intState = IOSimpleLockLockDisableInterrupt(mutex);
+
+        *(UInt32*)(heathrowBaseAddress + heathrowFCROffset) &= ~( heathrowFCSCCCEn | heathrowFCSCCAEn );
+		
+		if ( mutex  != NULL )
+     		IOSimpleLockUnlockEnableInterrupt(mutex, intState);
+
+}
+
+void Heathrow::ModemResetHigh()
+{
+		IOInterruptState intState;
+		
+		if ( mutex  != NULL )
+        	intState = IOSimpleLockLockDisableInterrupt(mutex);
+
+		
+     	*(UInt32*)(heathrowBaseAddress + heathrowFCROffset) |= ( heathrowFCSCCCEn | heathrowFCSCCAEn );        
+        
+		if ( mutex  != NULL )
+        	IOSimpleLockUnlockEnableInterrupt(mutex, intState);
+
+        
+}
+
+UInt8 Heathrow::readRegUInt8(unsigned long offset)
+{
+    return *(UInt8 *)(heathrowBaseAddress + offset);
+}
+
+void Heathrow::writeRegUInt8(unsigned long offset, UInt8 data)
+{
+    *(UInt8 *)(heathrowBaseAddress + offset) = data;
+    eieio();
+}
+
+void Heathrow::safeWriteRegUInt8(unsigned long offset, UInt8 mask, UInt8 data)
+{
+  IOInterruptState intState;
+
+  if ( mutex  != NULL )
+     intState = IOSimpleLockLockDisableInterrupt(mutex);
+
+  UInt8 currentReg = readRegUInt8(offset);
+  currentReg = (currentReg & ~mask) | (data & mask);
+  writeRegUInt8(offset, currentReg);
+  
+  if ( mutex  != NULL )
+     IOSimpleLockUnlockEnableInterrupt(mutex, intState);
+}
+
+UInt8 Heathrow::safeReadRegUInt8(unsigned long offset)
+{
+  IOInterruptState intState;
+  if ( mutex  != NULL )
+     intState = IOSimpleLockLockDisableInterrupt(mutex);
+  
+  UInt8 currentReg = readRegUInt8(offset);
+
+  if ( mutex  != NULL )
+     IOSimpleLockUnlockEnableInterrupt(mutex, intState);
+
+  return (currentReg);  
+}
+
+UInt32 Heathrow::readRegUInt32(unsigned long offset)
+{
+    return lwbrx(heathrowBaseAddress + offset);
+}
+
+void Heathrow::writeRegUInt32(unsigned long offset, UInt32 data)
+{
+  stwbrx(data, heathrowBaseAddress + offset);
+  eieio();
+}
+
+void Heathrow::safeWriteRegUInt32(unsigned long offset, UInt32 mask, UInt32 data)
+{
+  IOInterruptState intState;
+
+  if ( mutex  != NULL )
+     intState = IOSimpleLockLockDisableInterrupt(mutex);
+
+  UInt32 currentReg = readRegUInt32(offset);
+  currentReg = (currentReg & ~mask) | (data & mask);
+  writeRegUInt32(offset, currentReg);
+  
+  if ( mutex  != NULL )
+     IOSimpleLockUnlockEnableInterrupt(mutex, intState);
+}
+
+UInt32 Heathrow::safeReadRegUInt32(unsigned long offset)
+{
+  IOInterruptState intState;
+  if ( mutex  != NULL )
+     intState = IOSimpleLockLockDisableInterrupt(mutex);
+
+  UInt32 currentReg = readRegUInt32(offset);
+
+  if ( mutex  != NULL )
+     IOSimpleLockUnlockEnableInterrupt(mutex, intState);
+
+  return (currentReg);  
 }
 
 // --------------------------------------------------------------------------
@@ -244,7 +424,10 @@ IOReturn Heathrow::setPowerState(unsigned long powerStateOrdinal, IOService* wha
         }
         else if (heathrowNum == kPrimaryHeathrow) {
             kprintf("Heathrow would be powered off here\n");
-            /* None the CPU driver handles this */
+        *((unsigned long*)(heathrowBaseAddress + heathrowFCROffset)) &= ~heathrowFCIOBusEn;
+        OSSynchronizeIO();
+        *((unsigned long*)(heathrowBaseAddress + heathrowFCROffset)) &= ~heathrowFCATA0Reset;
+        OSSynchronizeIO(); 
         }
     }
     if ( powerStateOrdinal == 1 ) {
@@ -253,8 +436,11 @@ IOReturn Heathrow::setPowerState(unsigned long powerStateOrdinal, IOService* wha
             sleepState(false);
         }
         else if (heathrowNum == kPrimaryHeathrow) {
-            kprintf("Heathrow would be powered on here\n");
-            /* None the CPU driver handles this */
+            kprintf("Heathrow would be powered on here\n");            		
+        *((unsigned long*)(heathrowBaseAddress + heathrowFCROffset)) |=  heathrowFCIOBusEn;
+        OSSynchronizeIO();
+        *((unsigned long*)(heathrowBaseAddress + heathrowFCROffset)) |= heathrowFCATA0Reset;            
+        OSSynchronizeIO(); 
         }
     }
     return IOPMAckImplied;
@@ -264,6 +450,7 @@ bool Heathrow::installInterrupts(IOService *provider)
 {
   IORegistryEntry    *regEntry;
   OSSymbol           *interruptControllerName;
+  //IOInterruptAction is typedefed as a function ptr in xnu/iokit/IOKit/IOService.h
   IOInterruptAction  handler;
   AppleNMI           *appleNMI;
   long               nmiSource;
@@ -340,13 +527,13 @@ void Heathrow::enableMBATA()
 {
     unsigned long heathrowIDs, heathrowFCR;
 
-    heathrowIDs = lwbrx(heathrowBaseAddress + 0x34);
+    heathrowIDs = lwbrx(heathrowBaseAddress + heathrowIDOffset);
     if ((heathrowIDs & 0x0000FF00) == 0x00003000) {
-        heathrowFCR = lwbrx(heathrowBaseAddress + 0x38);
-
+        heathrowFCR = lwbrx(heathrowBaseAddress + heathrowFCROffset);
+		//this corresponds to heathrowFCATA1Reset in big Endian(bit 23 in little E)
         heathrowFCR |= 0x00800000;
 
-        stwbrx(heathrowFCR, heathrowBaseAddress + 0x38);
+        stwbrx(heathrowFCR, heathrowBaseAddress + heathrowFCROffset);
         IODelay(100);
     }
 }
@@ -357,7 +544,7 @@ void Heathrow::powerMediaBay(bool powerOn, UInt8 deviceOn)
     unsigned long powerDevice = deviceOn;
     
     //kprintf("Heathrow::powerMediaBay(%s) 0x%02x\n", (powerOn ? "TRUE" : "FALSE"), powerDevice);
-    ///kprintf(" 0 Heathrow::powerMediaBay = 0x%08lx\n", lwbrx(heathrowBaseAddress + 0x38));
+    ///kprintf(" 0 Heathrow::powerMediaBay = 0x%08lx\n", lwbrx(heathrowBaseAddress + heathrowFCROffset));
 
     if (mediaIsOn == powerOn)
         return;
@@ -366,39 +553,39 @@ void Heathrow::powerMediaBay(bool powerOn, UInt8 deviceOn)
     powerDevice = powerDevice << 26;
     powerDevice &= heathrowFCMediaBaybits;
     
-    heathrowIDs = lwbrx(heathrowBaseAddress + 0x34);
-    if ((heathrowIDs & 0x0000FF00) == 0x00003000) {
-        unsigned long *heathrowFCR = (unsigned long*)(heathrowBaseAddress + 0x38);
+    heathrowIDs = lwbrx(heathrowBaseAddress + heathrowIDOffset);
+    if ((heathrowIDs & 0x0000F000) != 0x00007000) {
+        unsigned long *heathrowFCR = (unsigned long*)(heathrowBaseAddress + heathrowFCROffset);
 
         kprintf(" 1 Heathrow::powerMediaBay = 0x%08lx\n", *heathrowFCR);
 
         // make sure media bay is in reset (MB reset bit is low)
-        *heathrowFCR &= ~(1<<heathrowFCMBReset);
+        *heathrowFCR &= ~heathrowFCMBReset;
         eieio();
 
         if (powerOn) {
             // we are powering on the bay and need a delay between turning on
             // media bay power and enabling the bus
-            *heathrowFCR &= ~(1<<heathrowFCMBPwr);
+            *heathrowFCR &= ~heathrowFCMBPwr;
             eieio();
 
             IODelay(50000);
         }
 
         // to turn on the buses, we ensure all buses are off and then turn on the ata bus
-        *heathrowFCR &= ~(heathrowFCMediaBaybits);
+        *heathrowFCR &= ~heathrowFCMediaBaybits;
         eieio();
         *heathrowFCR |= powerDevice;
         eieio();
         
         if (!powerOn) {
             // turn off media bay power
-            *heathrowFCR |= 1<<heathrowFCMBPwr;
+            *heathrowFCR |= heathrowFCMBPwr;
             eieio();
         }
         else {
             // take us out of reset
-            *heathrowFCR |= 1<<heathrowFCMBReset;
+            *heathrowFCR |= heathrowFCMBReset;
             eieio();
             
             enableMBATA();
@@ -406,7 +593,7 @@ void Heathrow::powerMediaBay(bool powerOn, UInt8 deviceOn)
 
         IODelay(50000);
         //kprintf(" 2 Heathrow::powerMediaBay = 0x%08lx\n", *heathrowFCR);
-        //kprintf(" 3 Heathrow::powerMediaBay = 0x%08lx\n", lwbrx(heathrowBaseAddress + 0x38));
+        //kprintf(" 3 Heathrow::powerMediaBay = 0x%08lx\n", lwbrx(heathrowBaseAddress + heathrowFCROffset));
     }
 
     mediaIsOn = powerOn;
@@ -551,16 +738,16 @@ void Heathrow::restoreInterruptState()
 
 void Heathrow::saveGPState()
 {
-    savedState.featureControlReg = *(UInt32*)(heathrowBaseAddress + 0x00000038);
-    savedState.auxControlReg     = *(UInt32*)(heathrowBaseAddress + 0x0000003C);
+    savedState.featureControlReg = *(UInt32*)(heathrowBaseAddress + heathrowFCROffset);
+    savedState.auxControlReg     = *(UInt32*)(heathrowBaseAddress + heathrowAUXFCROffset);
 }
 
 void Heathrow::restoreGPState()
 {
-    *(UInt32*)(heathrowBaseAddress + 0x00000038) = savedState.featureControlReg;
+    *(UInt32*)(heathrowBaseAddress + heathrowFCROffset) = savedState.featureControlReg;
     eieio();
     IODelay(1000);
-    *(UInt32*)(heathrowBaseAddress + 0x0000003C) = savedState.auxControlReg;
+    *(UInt32*)(heathrowBaseAddress + heathrowAUXFCROffset) = savedState.auxControlReg;
     eieio();
     IODelay(1000);
 }
@@ -570,7 +757,7 @@ void Heathrow::saveDMAState()
     int i;
     UInt32 channelOffset;
     
-    for (i = 0, channelOffset = 0; i < 12; i++, channelOffset += 0x0100)
+    for (i = 0, channelOffset = 0; i <= 12; i++, channelOffset += 0x0100)
     {
         volatile DBDMAChannelRegisters*	currentChannel;
 
@@ -588,7 +775,7 @@ void Heathrow::restoreDMAState()
     int i;
     UInt32 channelOffset;
 
-    for (i = 0, channelOffset = 0; i < 12; i++, channelOffset += 0x0100)
+    for (i = 0, channelOffset = 0; i <=12; i++, channelOffset += 0x0100)
     {
         volatile DBDMAChannelRegisters* currentChannel;
 
@@ -604,7 +791,7 @@ void Heathrow::restoreDMAState()
 
 void Heathrow::saveVIAState(void)
 {
-    UInt8* viaBase = (UInt8*)heathrowBaseAddress + 0x16000;
+    UInt8* viaBase = (UInt8*)heathrowBaseAddress + heathrowVIAOffset;
     UInt8* savedViaState = savedState.savedVIAState;
 
     // Save VIA state.  These registers don't seem to get restored to any known state.
@@ -621,7 +808,7 @@ void Heathrow::saveVIAState(void)
 
 void Heathrow::restoreVIAState(void)
 {
-    UInt8* viaBase = (UInt8*)heathrowBaseAddress + 0x16000;
+    UInt8* viaBase = (UInt8*)heathrowBaseAddress + heathrowVIAOffset;
     UInt8* savedViaState = savedState.savedVIAState;
 
     // Restore VIA state.  These registers don't seem to get restored to any known state.
@@ -671,7 +858,7 @@ IOReturn HeathrowInterruptController::initInterruptController(IOService *provide
   }
   bzero(vectors, kNumVectors * sizeof(IOInterruptVector));
   
-  // Allocate locks for the 
+  // Allocate locks 
   for (cnt = 0; cnt < kNumVectors; cnt++) {
     vectors[cnt].interruptLock = IOLockAlloc();
     if (vectors[cnt].interruptLock == NULL) {
@@ -717,6 +904,10 @@ void HeathrowInterruptController::clearAllInterrupts(void)
   eieio();
 }
 
+//returns the address of the handler function and casts it into type  IOInterruptAction
+//IOInterruptAction is typedeffed in iokit/IOKit/IOService.h as
+//ypedef void (*IOInterruptAction)( OSObject * target, void * refCon,
+//				   IOService * nub, int source );
 IOInterruptAction HeathrowInterruptController::getInterruptHandlerAddress(void)
 {
   return (IOInterruptAction)&HeathrowInterruptController::handleInterrupt;
@@ -728,6 +919,8 @@ IOReturn HeathrowInterruptController::handleInterrupt(void * /*refCon*/,
 {
   int               done;
   long              events, vectorNumber;
+  //Defined as a struct in iokit/IOKit/IOInterruptController.h, one of its elements is handler which is
+  //of type IOInterruptHandler
   IOInterruptVector *vector;
   unsigned long     maskTmp;
   
@@ -737,13 +930,17 @@ IOReturn HeathrowInterruptController::handleInterrupt(void * /*refCon*/,
     // Do all the sources for events1, plus any pending interrupts.
     // Also add in the "level" sensitive sources
     maskTmp = lwbrx(mask1Reg);
+    //clear external interrupts bits InterruptEvents register, which is read-only
     events = lwbrx(events1Reg) & ~kTypeLevelMask;
+    //now takes care of external interrupts bits with consideration of InterruptLevels register
     events |= lwbrx(levels1Reg) & maskTmp & kTypeLevelMask;
+	//now takes care of pending bits
     events |= pendingEvents1 & maskTmp;
     pendingEvents1 = 0;
     eieio();
     
     // Since we have to clear the level'd one clear the current edge's too.
+    //set external interrupts bits to 1 and as a result clears all the those bits in InterruptEvents register
     stwbrx(kTypeLevelMask | events, clear1Reg);
     eieio();
     
@@ -762,6 +959,7 @@ IOReturn HeathrowInterruptController::handleInterrupt(void * /*refCon*/,
 	
 	// Call the handler if it exists.
 	if (vector->interruptRegistered) {
+	//handler is of type IOInterruptHandler which is typedefed in iokit/IOKit/IOInterrupts.h as a func ptr
 	  vector->handler(vector->target, vector->refCon,
 			  vector->nub, vector->source);
 	}
@@ -837,7 +1035,8 @@ int HeathrowInterruptController::getVectorType(long vectorNumber, IOInterruptVec
 void HeathrowInterruptController::disableVectorHard(long vectorNumber, IOInterruptVector */*vector*/)
 {
   unsigned long     maskTmp;
-  
+  boolean_t         interruptState = ml_set_interrupts_enabled(FALSE);
+
   // Turn the source off at hardware.
   if (vectorNumber < kVectorsPerReg) {
     maskTmp = lwbrx(mask1Reg);
@@ -851,29 +1050,44 @@ void HeathrowInterruptController::disableVectorHard(long vectorNumber, IOInterru
     stwbrx(maskTmp, mask2Reg);
     eieio();
   }
+  
+  ml_set_interrupts_enabled(interruptState);
 }
 
 void HeathrowInterruptController::enableVector(long vectorNumber,
 					       IOInterruptVector *vector)
 {
   unsigned long     maskTmp;
-  
+  boolean_t         interruptState;
+
   if (vectorNumber < kVectorsPerReg) {
+
+    interruptState = ml_set_interrupts_enabled(FALSE);
+
     maskTmp = lwbrx(mask1Reg);
     maskTmp |= (1 << vectorNumber);
     stwbrx(maskTmp, mask1Reg);
     eieio();
+    
+    ml_set_interrupts_enabled(interruptState);
+
     if ((lwbrx(levels1Reg) & (1 << vectorNumber)) && (vector != NULL)) {
       // lost the interrupt
       causeVector(vectorNumber, vector);
     }
   } else {
     vectorNumber -= kVectorsPerReg;
+
+    interruptState = ml_set_interrupts_enabled(FALSE);
+
     maskTmp = lwbrx(mask2Reg);
     maskTmp |= (1 << vectorNumber);
     stwbrx(maskTmp, mask2Reg);
     eieio();
-    if ((lwbrx(levels1Reg) & (1 << vectorNumber)) && (vector != NULL)) {
+
+    ml_set_interrupts_enabled(interruptState);
+
+    if ((lwbrx(levels2Reg) & (1 << vectorNumber)) && (vector != NULL)) {
       // lost the interrupt
       causeVector(vectorNumber + kVectorsPerReg, vector);
     }
@@ -883,12 +1097,16 @@ void HeathrowInterruptController::enableVector(long vectorNumber,
 void HeathrowInterruptController::causeVector(long vectorNumber,
 					      IOInterruptVector */*vector*/)
 {
+  boolean_t  interruptState = ml_set_interrupts_enabled(FALSE);
+  
   if (vectorNumber < kVectorsPerReg) {
     pendingEvents1 |= 1 << vectorNumber;
   } else {
     vectorNumber -= kVectorsPerReg;
     pendingEvents2 |= 1 << vectorNumber;
   }
-
+  
+  ml_set_interrupts_enabled(interruptState);
+    
   parentNub->causeInterrupt(0);
 }
